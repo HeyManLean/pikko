@@ -2,14 +2,19 @@
 WF3 单集制作: 编写单集剧本 → 提取场景元素
 """
 
+import logging
+
 from agno.db.postgres import PostgresDb
 from agno.workflow.step import Step
 from agno.workflow.types import OnReject, StepInput, StepOutput
 from agno.workflow.workflow import Workflow
 
 from db import db_url, get_session
-from models.episode import Episode
+from models.episode import Episode, Scene
 from models.project import Project
+from utils.parsers import parse_scenes_from_script
+
+logger = logging.getLogger(__name__)
 
 
 def _build_episode_context(session, project_id: str) -> str:
@@ -58,13 +63,13 @@ def write_episode_script(step_input: StepInput) -> StepOutput:
         if not context:
             return StepOutput(content=f"错误：项目 {project_id} 不存在", success=False)
 
-        prompt = f"请编写第 {episode_number} 集的详细剧本。\n\n{context}"
-        if extra_req:
-            prompt += f"\n\n额外要求：{extra_req}"
+    response = episode_writer.run(
+        f"请编写第 {episode_number} 集的详细剧本。\n\n{context}"
+        + (f"\n\n额外要求：{extra_req}" if extra_req else "")
+    )
+    content = response.content if response else ""
 
-        response = episode_writer.run(prompt)
-        content = response.content if response else ""
-
+    with get_session() as session:
         existing = (
             session.query(Episode)
             .filter_by(project_id=project_id, number=episode_number)
@@ -85,9 +90,9 @@ def write_episode_script(step_input: StepInput) -> StepOutput:
             session.flush()
             episode_id = ep.id
 
-        return StepOutput(
-            content=f"## 第 {episode_number} 集剧本\n\n剧集 ID: {episode_id}\n\n{content}"
-        )
+    return StepOutput(
+        content=f"## 第 {episode_number} 集剧本\n\n剧集 ID: {episode_id}\n\n{content}"
+    )
 
 
 def extract_scene_elements(step_input: StepInput) -> StepOutput:
@@ -107,21 +112,53 @@ def extract_scene_elements(step_input: StepInput) -> StepOutput:
             return StepOutput(
                 content=f"错误：第 {episode_number} 集不存在", success=False
             )
-
+        episode_id = episode.id
+        plot_details = episode.plot_details or ""
         context = _build_episode_context(session, project_id)
 
-        prompt = (
-            f"请从第 {episode_number} 集的剧本中提取并设计所有视觉元素。\n\n"
-            f"项目背景：\n{context}\n\n"
-            f"本集剧本：\n{episode.plot_details or ''}"
-        )
+    response = scene_designer.run(
+        f"请从第 {episode_number} 集的剧本中提取并设计所有视觉元素。\n\n"
+        f"项目背景：\n{context}\n\n"
+        f"本集剧本：\n{plot_details}"
+    )
+    visual_content = response.content if response else ""
 
-        response = scene_designer.run(prompt)
-        content = response.content if response else ""
+    parsed_scenes = parse_scenes_from_script(plot_details)
+    logger.info("parsed %d scenes from episode %d script", len(parsed_scenes), episode_number)
 
-        return StepOutput(
-            content=f"## 第 {episode_number} 集视觉元素\n\n{content}\n\n单集制作流程完成！"
+    with get_session() as session:
+        session.query(Scene).filter_by(episode_id=episode_id).delete()
+
+        if parsed_scenes:
+            for s in parsed_scenes:
+                scene = Scene(
+                    episode_id=episode_id,
+                    number=int(s.get("number", 1)),
+                    description=s.get("description"),
+                    location=s.get("location"),
+                    dialogue=s.get("dialogue"),
+                    props=s.get("props"),
+                    characters_involved=s.get("characters_involved"),
+                )
+                session.add(scene)
+        else:
+            session.add(Scene(
+                episode_id=episode_id,
+                number=1,
+                description=plot_details[:1000] if plot_details else None,
+            ))
+        session.flush()
+
+        scene_count = session.query(Scene).filter_by(episode_id=episode_id).count()
+
+    return StepOutput(
+        content=(
+            f"## 第 {episode_number} 集视觉元素\n\n"
+            f"已创建 {scene_count} 个场景记录。\n\n"
+            f"{visual_content}\n\n"
+            f"单集制作流程完成！"
         )
+    )
 
 
 wf_episode_production = Workflow(

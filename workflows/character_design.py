@@ -2,14 +2,19 @@
 WF2 角色设计: 角色设定 → 角色图
 """
 
+import logging
+
 from agno.db.postgres import PostgresDb
 from agno.workflow.step import Step
 from agno.workflow.types import OnReject, StepInput, StepOutput
 from agno.workflow.workflow import Workflow
 
+from clients.volcengine import VolcengineAPIError, sync_generate_image
 from db import db_url, get_session
 from models.character import Character
 from models.project import Project
+
+logger = logging.getLogger(__name__)
 
 
 def create_character_setting(step_input: StepInput) -> StepOutput:
@@ -36,19 +41,20 @@ def create_character_setting(step_input: StepInput) -> StepOutput:
         if project.characters:
             existing_chars = "\n已有角色：" + ", ".join(c.name for c in project.characters)
 
-        prompt = (
-            f"请为漫剧「{project.name}」的角色「{name}」生成详细的视觉设定。\n\n"
-            f"角色定位：{role}\n性格：{personality}"
-        )
-        if appearance:
-            prompt += f"\n外观参考：{appearance}"
-        if relationships:
-            prompt += f"\n角色关系：{relationships}"
-        prompt += world_context + existing_chars
+    prompt = (
+        f"请为漫剧「{project.name}」的角色「{name}」生成详细的视觉设定。\n\n"
+        f"角色定位：{role}\n性格：{personality}"
+    )
+    if appearance:
+        prompt += f"\n外观参考：{appearance}"
+    if relationships:
+        prompt += f"\n角色关系：{relationships}"
+    prompt += world_context + existing_chars
 
-        response = character_artist.run(prompt)
-        content = response.content if response else ""
+    response = character_artist.run(prompt)
+    content = response.content if response else ""
 
+    with get_session() as session:
         existing = session.query(Character).filter_by(project_id=project_id, name=name).first()
         if existing:
             existing.role = role
@@ -69,9 +75,9 @@ def create_character_setting(step_input: StepInput) -> StepOutput:
             session.flush()
             char_id = char.id
 
-        return StepOutput(
-            content=f"## 角色设定完成：{name}\n\n角色 ID: {char_id}\n\n{content}"
-        )
+    return StepOutput(
+        content=f"## 角色设定完成：{name}\n\n角色 ID: {char_id}\n\n{content}"
+    )
 
 
 def generate_character_image(step_input: StepInput) -> StepOutput:
@@ -90,18 +96,30 @@ def generate_character_image(step_input: StepInput) -> StepOutput:
             f"appearance: {char.appearance or char.personality or 'anime style character'}, "
             f"clean white background, anime style, high quality"
         )
-
         char.image_prompt = prompt
-        # TODO: integrate actual image generation API (DALL-E / gpt-image-1)
-        char.image_url = None
+        char_id = char.id
 
-        return StepOutput(
-            content=(
-                f"## 角色图生成：{char.name}\n\n"
-                f"**图片提示词：**\n```\n{prompt}\n```\n\n"
-                f"角色设计流程完成！实际图片生成 API 集成后将自动生成图片。"
-            )
+    image_url: str | None = None
+    try:
+        image_url = sync_generate_image(prompt)
+    except VolcengineAPIError:
+        logger.exception("failed to generate character image for %s", char_name)
+
+    if image_url:
+        with get_session() as session:
+            char = session.get(Character, char_id)
+            if char:
+                char.image_url = image_url
+
+    status = f"图片已生成：{image_url}" if image_url else "图片生成 API 未配置或调用失败，已保存提示词"
+    return StepOutput(
+        content=(
+            f"## 角色图生成：{char_name}\n\n"
+            f"**图片提示词：**\n```\n{prompt}\n```\n\n"
+            f"{status}\n\n"
+            f"角色设计流程完成！"
         )
+    )
 
 
 wf_character_design = Workflow(

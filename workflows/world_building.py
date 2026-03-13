@@ -2,6 +2,8 @@
 WF1 世界构建: 创建世界观 → 设计角色网络 → 创建剧情大纲
 """
 
+import logging
+
 from agno.db.postgres import PostgresDb
 from agno.workflow.step import Step
 from agno.workflow.types import OnReject, StepInput, StepOutput
@@ -11,6 +13,9 @@ from db import db_url, get_session
 from models.character import Character
 from models.project import Project
 from models.world import PlotOutline, World
+from utils.parsers import parse_characters, parse_plot_outline
+
+logger = logging.getLogger(__name__)
 
 
 def _get_project_context(session, project_id: str) -> dict:
@@ -54,24 +59,28 @@ def build_world(step_input: StepInput) -> StepOutput:
         project = session.get(Project, project_id)
         if not project:
             return StepOutput(content=f"错误：项目 {project_id} 不存在", success=False)
+        project_name = project.name
+        project_desc = project.description
+        project_genre = project.genre
 
-        prompt = (
-            f"请为漫剧「{project.name}」构建世界观设定。\n\n"
-            f"项目描述：{project.description}\n题材：{project.genre or '未指定'}"
-        )
-        if extra_req:
-            prompt += f"\n\n额外要求：{extra_req}"
+    prompt = (
+        f"请为漫剧「{project_name}」构建世界观设定。\n\n"
+        f"项目描述：{project_desc}\n题材：{project_genre or '未指定'}"
+    )
+    if extra_req:
+        prompt += f"\n\n额外要求：{extra_req}"
 
-        response = world_builder.run(prompt)
-        content = response.content if response else ""
+    response = world_builder.run(prompt)
+    content = response.content if response else ""
 
+    with get_session() as session:
         existing = session.query(World).filter_by(project_id=project_id).first()
         if existing:
             existing.setting = content
         else:
             session.add(World(project_id=project_id, setting=content))
 
-        return StepOutput(content=content)
+    return StepOutput(content=content)
 
 
 def design_character_network(step_input: StepInput) -> StepOutput:
@@ -86,18 +95,55 @@ def design_character_network(step_input: StepInput) -> StepOutput:
         if not ctx:
             return StepOutput(content=f"错误：项目 {project_id} 不存在", success=False)
 
-        prompt = (
-            f"请为漫剧「{ctx['project_name']}」设计角色网络。\n\n"
-            f"项目描述：{ctx['description']}\n题材：{ctx.get('genre', '未指定')}"
-        )
-        if ctx.get("world"):
-            prompt += f"\n\n已有世界观设定：\n{ctx['world'].get('setting', '')}"
-        if extra_req:
-            prompt += f"\n\n额外要求：{extra_req}"
+    prompt = (
+        f"请为漫剧「{ctx['project_name']}」设计角色网络。\n\n"
+        f"项目描述：{ctx['description']}\n题材：{ctx.get('genre', '未指定')}"
+    )
+    if ctx.get("world"):
+        prompt += f"\n\n已有世界观设定：\n{ctx['world'].get('setting', '')}"
+    if extra_req:
+        prompt += f"\n\n额外要求：{extra_req}"
 
-        response = character_architect.run(prompt)
-        content = response.content if response else ""
-        return StepOutput(content=content)
+    response = character_architect.run(prompt)
+    content = response.content if response else ""
+
+    parsed_chars = parse_characters(content)
+    logger.info("parsed %d characters from character_architect output", len(parsed_chars))
+
+    with get_session() as session:
+        for c in parsed_chars:
+            name = c.get("name", "")
+            if not name:
+                continue
+            existing = session.query(Character).filter_by(
+                project_id=project_id, name=name
+            ).first()
+            if existing:
+                if c.get("role"):
+                    existing.role = c["role"]
+                if c.get("personality"):
+                    existing.personality = c["personality"]
+                if c.get("appearance"):
+                    existing.appearance = c["appearance"]
+                if c.get("relationships"):
+                    existing.relationships = c["relationships"]
+            else:
+                session.add(Character(
+                    project_id=project_id,
+                    name=name,
+                    role=c.get("role"),
+                    personality=c.get("personality"),
+                    appearance=c.get("appearance"),
+                    relationships=c.get("relationships"),
+                ))
+
+    char_count = len(parsed_chars)
+    return StepOutput(
+        content=(
+            f"{content}\n\n"
+            f"---\n已创建/更新 {char_count} 个角色记录。"
+        )
+    )
 
 
 def create_plot_outline(step_input: StepInput) -> StepOutput:
@@ -112,31 +158,44 @@ def create_plot_outline(step_input: StepInput) -> StepOutput:
         if not ctx:
             return StepOutput(content=f"错误：项目 {project_id} 不存在", success=False)
 
-        prompt = (
-            f"请为漫剧「{ctx['project_name']}」设计剧情大纲。\n\n"
-            f"项目描述：{ctx['description']}\n题材：{ctx.get('genre', '未指定')}"
+    prompt = (
+        f"请为漫剧「{ctx['project_name']}」设计剧情大纲。\n\n"
+        f"项目描述：{ctx['description']}\n题材：{ctx.get('genre', '未指定')}"
+    )
+    if ctx.get("world"):
+        prompt += f"\n\n世界观设定：\n{ctx['world'].get('setting', '')}"
+    if ctx.get("characters"):
+        chars_text = "\n".join(
+            f"- {c['name']}（{c.get('role', '未定义')}）：{c.get('personality', '')}"
+            for c in ctx["characters"]
         )
-        if ctx.get("world"):
-            prompt += f"\n\n世界观设定：\n{ctx['world'].get('setting', '')}"
-        if ctx.get("characters"):
-            chars_text = "\n".join(
-                f"- {c['name']}（{c.get('role', '未定义')}）：{c.get('personality', '')}"
-                for c in ctx["characters"]
-            )
-            prompt += f"\n\n已有角色：\n{chars_text}"
-        if extra_req:
-            prompt += f"\n\n额外要求：{extra_req}"
+        prompt += f"\n\n已有角色：\n{chars_text}"
+    if extra_req:
+        prompt += f"\n\n额外要求：{extra_req}"
 
-        response = plot_designer.run(prompt)
-        content = response.content if response else ""
+    response = plot_designer.run(prompt)
+    content = response.content if response else ""
 
+    parsed = parse_plot_outline(content)
+
+    with get_session() as session:
         existing = session.query(PlotOutline).filter_by(project_id=project_id).first()
         if existing:
-            existing.synopsis = content
+            existing.synopsis = parsed.get("synopsis") or content
+            existing.themes = parsed.get("themes")
+            existing.arc_structure = parsed.get("arc_structure")
+            if parsed.get("total_episodes") is not None:
+                existing.total_episodes = parsed["total_episodes"]
         else:
-            session.add(PlotOutline(project_id=project_id, synopsis=content))
+            session.add(PlotOutline(
+                project_id=project_id,
+                synopsis=parsed.get("synopsis") or content,
+                themes=parsed.get("themes"),
+                arc_structure=parsed.get("arc_structure"),
+                total_episodes=parsed.get("total_episodes"),
+            ))
 
-        return StepOutput(content=content)
+    return StepOutput(content=content)
 
 
 wf_world_building = Workflow(

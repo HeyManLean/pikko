@@ -36,7 +36,7 @@ instructions = """\
 | 世界构建 | wf1_world_building | 世界观→角色网络→剧情大纲 | project_id |
 | 角色设计 | wf2_character_design | 角色设定→角色图 | project_id, name, role, personality |
 | 单集制作 | wf3_episode | 单集剧本→场景元素提取 | project_id, episode_number |
-| 分镜生成 | wf4_storyboard | 生成分镜脚本 | project_id, episode_number |
+| 分镜生成 | wf4_storyboard | 分镜脚本→分镜图→视频 | project_id, episode_number |
 
 ### 工作流交互流程
 
