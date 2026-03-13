@@ -1,0 +1,41 @@
+services:
+  pikko-api:
+    container_name: pikko-api
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=pikko-db
+      - DB_PORT=5432
+      - DB_USER=ai
+      - DB_PASS=ai
+      - DB_DATABASE=ai
+    depends_on:
+      pikko-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  pikko-db:
+    container_name: pikko-db
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: ai
+      POSTGRES_PASSWORD: ai
+      POSTGRES_DB: ai
+    ports:
+      - "5432:5432"
+    volumes:
+      - pikko-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai -d ai"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  pikko-pgdata:
